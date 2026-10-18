@@ -41,9 +41,10 @@ return view.extend({
 		return [
 			rt.hero('Aggiornamenti del firmware', 'Per ogni nuova OpenWrt stabile GitHub costruisce l\'immagine del Brume con tutte le sue funzioni; da qui la installi mantenendo la configurazione.', [
 				rt.pill('box', 'OpenWrt ' + s.current),
-				s.available ? rt.pill('download', 'Disponibile ' + s.latest, true) : rt.pill('check', s.checked ? 'Aggiornato' : 'Non ancora controllato')
+				s.available ? rt.pill('download', 'Disponibile ' + s.latest, true) : rt.pill('check', s.checked ? 'Aggiornato' : 'Non ancora controllato', !s.checked)
 			]),
-			rt.card('download', s.available ? 'warn' : 'ok', 'Firmware', s.available ? rt.badge('warn', 'Nuova versione') : rt.badge('ok', 'Aggiornato'), [
+			rt.card('download', s.available ? 'warn' : s.checked ? 'ok' : 'info', 'Firmware',
+				s.available ? rt.badge('warn', 'Nuova versione') : s.checked ? rt.badge('ok', 'Aggiornato') : rt.badge('off', 'Da controllare'), [
 				rt.kv([
 					[ 'Installato', 'OpenWrt ' + s.current ],
 					[ 'Ultimo su GitHub', s.latest ? E('a', { 'href': s.url, 'target': '_blank', 'rel': 'noreferrer' }, [ 'OpenWrt ' + s.latest ]) : '—' ],
