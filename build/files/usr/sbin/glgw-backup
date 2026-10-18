@@ -1,0 +1,27 @@
+#!/bin/sh
+# Backup notturno della configurazione del Brume (sysupgrade -b: /etc/config,
+# AdGuard Home, Unbound, identità NetBird, file di /etc/sysupgrade.conf).
+# Va sul primo disco USB montato (cartella nascosta .brume-backup), altrimenti
+# sull'eMMC in /opt/brume-backup. Tiene gli ultimi 14.
+# Attenzione: contiene chiavi VPN; il disco USB è condiviso in rete con l'utente "nas".
+
+KEEP=14
+DEST=
+for m in /mnt/sd*; do
+	grep -q " $m " /proc/mounts && { DEST=$m/.brume-backup; break; }
+done
+[ -n "$DEST" ] || DEST=/opt/brume-backup
+
+umask 077
+mkdir -p "$DEST" || { logger -t glgw-backup "impossibile creare $DEST"; exit 1; }
+
+f=$DEST/brume-$(date +%Y%m%d-%H%M).tar.gz
+if sysupgrade -b "$f" >/dev/null 2>&1; then
+	logger -t glgw-backup "backup salvato in $f ($(wc -c < "$f") byte)"
+else
+	rm -f "$f"
+	logger -t glgw-backup "backup non riuscito in $DEST"
+	exit 1
+fi
+
+ls -1t "$DEST"/brume-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do rm -f "$old"; done

@@ -1,0 +1,47 @@
+#!/bin/sh
+# Aggiorna il Brume all'immagine della release GitHub "openwrt-<versione>"
+# (repository pubblico mich-de/brume-firmware, costruita da GitHub Actions).
+# Avviato da Brume › Aggiornamenti: scarica in RAM, controlla lo SHA-256 della
+# release e la compatibilità (sysupgrade -T), poi sysupgrade mantenendo la
+# configurazione. Lo stato per la GUI va in /tmp/glgw/fw-state.
+
+V=$1
+REPO=mich-de/brume-firmware
+DIR=/tmp/glgw
+BIN=$DIR/firmware.bin
+
+case "$V" in
+	*[!0-9.]*|'') echo "uso: $0 <versione OpenWrt, es. 25.12.6>" >&2; exit 1 ;;
+esac
+
+NAME=openwrt-$V-mediatek-filogic-glinet_gl-mt2500-airoha-squashfs-sysupgrade.bin
+BASE=https://github.com/$REPO/releases/download/openwrt-$V
+
+mkdir -p -m 0700 "$DIR"
+echo $$ > "$DIR/fw-pid"
+
+state() {
+	echo "$1" > "$DIR/fw-state"
+	logger -t glgw-fwupgrade "$1"
+}
+
+fail() {
+	state "errore: $1"
+	rm -f "$BIN" "$DIR/fw-pid"
+	exit 1
+}
+
+state download
+rm -f "$BIN"
+uclient-fetch -q -T 60 -O "$BIN" "$BASE/$NAME" || fail "download dell'immagine non riuscito"
+
+state verifica
+want=$(uclient-fetch -q -T 15 -O - "$BASE/sha256sums.txt" | awk -v n="$NAME" '$2 == n { print $1 }')
+got=$(sha256sum "$BIN" | cut -d' ' -f1)
+[ -n "$want" ] && [ "$want" = "$got" ] || fail "lo SHA-256 dell'immagine non corrisponde a quello della release"
+sysupgrade -T "$BIN" >/dev/null 2>&1 || fail "immagine rifiutata da sysupgrade (non adatta a questo router)"
+
+state installazione
+sync
+# se va bene procd ferma tutto e scrive l'immagine: qui si torna solo per un errore
+sysupgrade "$BIN" || fail "sysupgrade non è partito"

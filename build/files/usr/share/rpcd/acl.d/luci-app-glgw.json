@@ -1,0 +1,21 @@
+{
+	"luci-app-glgw": {
+		"description": "Grant access to the Brume (GL-MT2500) panel",
+		"read": {
+			"ubus": {
+				"luci.glgw": [ "status", "wg_list", "nb_status", "dns_status", "st_status", "net_status", "acc_status", "fw_status" ],
+				"luci-rpc": [ "getDHCPLeases", "getHostHints" ],
+				"network.interface.wan": [ "status" ],
+				"system": [ "board", "info" ]
+			},
+			"uci": [ "glgw" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.glgw": [ "wg_add", "wg_del", "wg_endpoint", "wg_file", "nb_up", "nb_down", "service_set", "st_password", "st_umount", "st_internal_create", "net_set", "agh_login", "root_clear", "fw_check", "fw_upgrade" ],
+				"luci": [ "setPassword" ]
+			},
+			"uci": [ "glgw" ]
+		}
+	}
+}

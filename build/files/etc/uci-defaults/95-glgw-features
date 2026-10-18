@@ -1,0 +1,114 @@
+#!/bin/sh
+# gl.inet gw (GL-MT2500): VPN WireGuard da fuori, LED e statistiche, disco USB
+# condiviso, offload hardware + SQM. Una sola volta per dispositivo (marcatore
+# in /etc/config/glgw): i sysupgrade successivi non toccano le modifiche dopo.
+
+touch /etc/config/glgw
+uci -q get glgw.defaults >/dev/null || uci set glgw.defaults=defaults
+[ "$(uci -q get glgw.defaults.features)" = 1 ] && exit 0
+
+HOME_NET=192.168.188.0/24   # rete del FRITZ!Box, lato WAN del Brume
+
+# --- VPN WireGuard (server) ---------------------------------------------------
+# Chiave del server generata qui sul dispositivo: nessun segreto nell'immagine.
+# I client si creano dalla GUI (Brume › Server WireGuard), che mostra la loro
+# chiave privata una sola volta senza salvarla sul router.
+umask 077
+SRV_KEY=$(wg genkey)
+
+uci batch <<EOF
+set network.wg0=interface
+set network.wg0.proto=wireguard
+set network.wg0.private_key=$SRV_KEY
+set network.wg0.listen_port=51820
+add_list network.wg0.addresses=10.66.66.1/24
+
+set firewall.vpn=zone
+set firewall.vpn.name=vpn
+add_list firewall.vpn.network=wg0
+set firewall.vpn.input=ACCEPT
+set firewall.vpn.output=ACCEPT
+set firewall.vpn.forward=REJECT
+set firewall.vpn_wan=forwarding
+set firewall.vpn_wan.src=vpn
+set firewall.vpn_wan.dest=wan
+set firewall.vpn_lan=forwarding
+set firewall.vpn_lan.src=vpn
+set firewall.vpn_lan.dest=lan
+set firewall.wg_in=rule
+set firewall.wg_in.name=WireGuard-in
+set firewall.wg_in.src=wan
+set firewall.wg_in.proto=udp
+set firewall.wg_in.dest_port=51820
+set firewall.wg_in.target=ACCEPT
+EOF
+
+# --- Disco USB condiviso (Samba) -----------------------------------------------
+# Ogni partizione USB viene montata da sola in /mnt/<dispositivo>; la cartella
+# condivisa "usb" mostra /mnt. Accesso con l'utente "nas": la password la
+# imposta l'utente con  smbpasswd -a nas
+[ -s /etc/config/fstab ] || block detect > /etc/config/fstab
+uci -q get fstab.@global[0] >/dev/null || uci add fstab global
+uci set fstab.@global[0].anon_mount=1
+uci set fstab.@global[0].auto_mount=1
+
+grep -q '^nas:' /etc/group || echo 'nas:x:1000:' >> /etc/group
+grep -q '^nas:' /etc/passwd || echo 'nas:*:1000:1000:nas:/var:/bin/false' >> /etc/passwd
+
+uci batch <<EOF
+set samba4.@samba[0].interface='lan wan wg0'
+set samba4.@samba[0].description='gl.inet gw'
+set samba4.usb=sambashare
+set samba4.usb.name=usb
+set samba4.usb.path=/mnt
+set samba4.usb.read_only=no
+set samba4.usb.guest_ok=no
+set samba4.usb.users=nas
+set samba4.usb.force_root=1
+set samba4.usb.create_mask=0666
+set samba4.usb.dir_mask=0777
+set firewall.web_casa=rule
+set firewall.web_casa.name=Web-casa
+set firewall.web_casa.src=wan
+set firewall.web_casa.src_ip=$HOME_NET
+set firewall.web_casa.family=ipv4
+set firewall.web_casa.proto=tcp
+add_list firewall.web_casa.dest_port=80
+add_list firewall.web_casa.dest_port=443
+set firewall.web_casa.target=ACCEPT
+set firewall.ssh_casa=rule
+set firewall.ssh_casa.name=SSH-casa
+set firewall.ssh_casa.src=wan
+set firewall.ssh_casa.src_ip=$HOME_NET
+set firewall.ssh_casa.family=ipv4
+set firewall.ssh_casa.proto=tcp
+set firewall.ssh_casa.dest_port=22
+set firewall.ssh_casa.target=ACCEPT
+set firewall.smb_casa=rule
+set firewall.smb_casa.name=Samba-casa
+set firewall.smb_casa.src=wan
+set firewall.smb_casa.src_ip=$HOME_NET
+set firewall.smb_casa.family=ipv4
+set firewall.smb_casa.proto=tcp
+set firewall.smb_casa.dest_port=445
+set firewall.smb_casa.target=ACCEPT
+EOF
+
+# --- Statistiche (luci-app-statistics) -----------------------------------------
+for p in cpu memory load interface thermal uptime df; do
+	uci -q set luci_statistics.collectd_$p.enable=1
+done
+
+# --- Offload hardware (PPE) -----------------------------------------------------
+# SQM resta installato ma spento: i flussi in offload non passano dalle code,
+# quindi vanno usati in alternativa (vedi README).
+uci set firewall.@defaults[0].flow_offloading=1
+uci set firewall.@defaults[0].flow_offloading_hw=1
+
+# --- LED: blu = internet, bianco = AdGuard, vpn = tunnel attivo --------------------
+mkdir -p /etc/crontabs
+grep -q glgw-leds /etc/crontabs/root 2>/dev/null || echo '* * * * * /usr/sbin/glgw-leds' >> /etc/crontabs/root
+
+uci set glgw.defaults.features=1
+uci commit
+exit 0

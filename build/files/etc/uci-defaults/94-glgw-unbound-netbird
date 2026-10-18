@@ -1,0 +1,54 @@
+#!/bin/sh
+# gl.inet gw: Unbound (resolver ricorsivo dietro AdGuard Home) e NetBird
+# (mesh VPN). Una sola volta per dispositivo (marcatore in /etc/config/glgw).
+
+touch /etc/config/glgw
+uci -q get glgw.defaults >/dev/null || uci set glgw.defaults=defaults
+[ "$(uci -q get glgw.defaults.unbound_netbird)" = 1 ] && exit 0
+
+# --- Unbound: solo upstream di AdGuard (127.0.0.1:5335), la 53 resta ad AdGuard.
+# validator_ntp: senza RTC l'ora al boot è sbagliata; DNSSEC applicato in pieno
+# solo dopo la sincronizzazione NTP, altrimenti nulla si risolverebbe.
+uci batch <<EOF
+set unbound.ub_main.listen_port=5335
+set unbound.ub_main.unbound_control=1
+set unbound.ub_main.localservice=1
+set unbound.ub_main.validator=1
+set unbound.ub_main.validator_ntp=1
+set unbound.ub_main.resource=medium
+set unbound.ub_main.dhcp_link=none
+set unbound.ub_main.query_minimize=1
+set unbound.auth_icann.enabled=1
+EOF
+# prefetch e serve-expired: /etc/unbound/unbound_srv.conf (nell'overlay dell'immagine)
+
+# --- NetBird: interfaccia wt0 in una zona propria. Verso "wan" passa per la rete
+# di casa (masquerade), così il Brume può fare da routing peer per 192.168.188.0/24.
+uci batch <<EOF
+set network.netbird=interface
+set network.netbird.proto=none
+set network.netbird.device=wt0
+set firewall.netbird=zone
+set firewall.netbird.name=netbird
+add_list firewall.netbird.network=netbird
+set firewall.netbird.input=ACCEPT
+set firewall.netbird.output=ACCEPT
+set firewall.netbird.forward=REJECT
+set firewall.netbird_wan=forwarding
+set firewall.netbird_wan.src=netbird
+set firewall.netbird_wan.dest=wan
+set firewall.netbird_lan=forwarding
+set firewall.netbird_lan.src=netbird
+set firewall.netbird_lan.dest=lan
+set firewall.lan_netbird=forwarding
+set firewall.lan_netbird.src=lan
+set firewall.lan_netbird.dest=netbird
+EOF
+
+# L'identità del peer NetBird sta in /root/.config/netbird (NB_STATE_DIR
+# dell'init script): senza questa riga un sysupgrade la cancellerebbe.
+grep -q '^/root/.config/netbird/' /etc/sysupgrade.conf || echo '/root/.config/netbird/' >> /etc/sysupgrade.conf
+
+uci set glgw.defaults.unbound_netbird=1
+uci commit
+exit 0

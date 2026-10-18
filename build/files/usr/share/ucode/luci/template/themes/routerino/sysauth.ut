@@ -1,0 +1,28 @@
+{#
+ Accesso: modulo normale (funziona anche senza JavaScript), utente root già scritto.
+-#}
+
+{% include('header', { blank_page: true }) %}
+
+<main class="rt-login">
+	<form method="post" class="rt-login-card">
+		<span class="rt-brand"><span class="rt-mark" aria-hidden="true">RTR</span><span class="rt-name"><strong>{{ striptags(ubus.call('system', 'board')?.hostname ?? '') }}</strong><small>Pannello del router</small></span></span>
+		<h1>Accedi</h1>
+		<p>Inserisci la password di amministratore.</p>
+
+		{% if (fuser): %}
+		<div class="rt-login-err" role="alert">Nome utente o password sbagliati. Riprova.</div>
+		{% endif %}
+
+		<label for="luci_username">Utente</label>
+		<input name="luci_username" id="luci_username" type="text" autocomplete="username" value="{{ entityencode(duser, true) }}">
+
+		<label for="luci_password">Password</label>
+		<input name="luci_password" id="luci_password" type="password" autocomplete="current-password" autofocus>
+
+		<button class="btn" type="submit">Accedi</button>
+		<small>Se non hai mai impostato una password, lascia il campo vuoto.</small>
+	</form>
+</main>
+
+{% include('footer', { blank_page: true }) %}

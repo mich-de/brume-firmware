@@ -1,0 +1,6 @@
+#!/bin/sh
+# Controllo degli aggiornamenti del firmware (release GitHub) ogni 6 ore: il
+# risultato compare in Brume › Aggiornamenti e negli avvisi della Panoramica.
+mkdir -p /etc/crontabs
+grep -q fw_check /etc/crontabs/root 2>/dev/null || echo '23 */6 * * * ubus call luci.glgw fw_check >/dev/null 2>&1' >> /etc/crontabs/root
+exit 0

@@ -1,0 +1,9 @@
+#!/bin/sh
+# AdGuard Home scarica le liste di blocco all'avvio e poi ogni 24 ore: se parte
+# prima che la WAN abbia internet (boot, FRITZ!Box che riparte) resterebbe senza
+# blocco fino al giorno dopo. Al collegamento della WAN lo si riavvia.
+
+[ "$ACTION" = ifup ] && [ "$INTERFACE" = wan ] || exit 0
+/etc/init.d/adguardhome enabled || exit 0
+
+(sleep 15; /etc/init.d/adguardhome restart) >/dev/null 2>&1 &

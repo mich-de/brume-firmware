@@ -1,0 +1,37 @@
+#!/bin/sh
+# gl.inet gw: banIP (indirizzi malevoli bloccati in ingresso), Watchcat (riavvio
+# della WAN se internet non risponde) e backup notturno della configurazione.
+# Una sola volta per dispositivo (marcatore in /etc/config/glgw).
+
+touch /etc/config/glgw
+uci -q get glgw.defaults >/dev/null || uci set glgw.defaults=defaults
+[ "$(uci -q get glgw.defaults.protection)" = 1 ] && exit 0
+
+# banIP: feed di attaccanti noti, pochi falsi positivi. Niente "bogon": la rete
+# di casa (192.168.188.0/24, lato WAN) è privata e verrebbe bloccata.
+uci set banip.global.ban_enabled=1
+uci -q delete banip.global.ban_feed
+for f in firehol1 cinsscore debl turris; do uci add_list banip.global.ban_feed=$f; done
+
+# Watchcat: dopo 10 minuti senza risposta da 1.1.1.1 e 9.9.9.9 riavvia solo la
+# WAN. Niente riavvio del router: durante un guasto del provider svuoterebbe la
+# cache DNS della casa proprio quando serve.
+while uci -q delete watchcat.@watchcat[0]; do :; done
+uci batch <<EOF
+set watchcat.wan_check=watchcat
+set watchcat.wan_check.mode=restart_iface
+set watchcat.wan_check.interface=wan
+set watchcat.wan_check.period=10m
+set watchcat.wan_check.pinghosts='1.1.1.1 9.9.9.9'
+set watchcat.wan_check.pingperiod=30s
+set watchcat.wan_check.addressfamily=ipv4
+set watchcat.wan_check.reset_failure_timer=1
+EOF
+
+# Backup della configurazione ogni notte alle 03:30.
+mkdir -p /etc/crontabs
+grep -q glgw-backup /etc/crontabs/root 2>/dev/null || echo '30 3 * * * /usr/sbin/glgw-backup' >> /etc/crontabs/root
+
+uci set glgw.defaults.protection=1
+uci commit
+exit 0

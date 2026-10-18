@@ -1,0 +1,889 @@
+'use strict';
+// Backend della GUI "Brume" (ispirata alla GUI GL.iNet 4.9.0): stato del router,
+// server WireGuard, NetBird, catena DNS AdGuard Home → Unbound, disco USB/Samba,
+// offload hardware e SQM. Nei comandi finiscono solo stringhe costanti o valori
+// validati qui; i segreti passano da file 0600 o da stdin, mai da argv.
+
+import { readfile, writefile, stat, unlink, popen, lsdir, mkdir } from 'fs';
+import { cursor } from 'uci';
+
+const TMP = '/tmp/glgw';
+const VPN_DIR = '/root/vpn';
+const WG_NET = '10.66.66.';
+const B64KEY = /^[A-Za-z0-9+\/]{43}=$/;
+const SERVICES = { adguardhome: 'AdGuardHome', unbound: 'unbound', netbird: 'netbird', samba4: 'smbd', collectd: 'collectd' };
+
+function sh(cmd) {
+	const p = popen(cmd);
+	const out = p ? p.read('all') : '';
+
+	p?.close();
+
+	return out ?? '';
+}
+
+function tmpdir() {
+	if (!stat(TMP)) mkdir(TMP, 0700);
+	return TMP;
+}
+
+function sysfs(path) {
+	return trim(readfile(path) ?? '');
+}
+
+function service(name) {
+	return {
+		running: system('pidof ' + SERVICES[name] + ' >/dev/null 2>&1') == 0,
+		enabled: system('/etc/init.d/' + name + ' enabled') == 0
+	};
+}
+
+// --- WireGuard ------------------------------------------------------------------
+
+// `wg show wg0 dump`: prima riga l'interfaccia (contiene la chiave privata: non
+// esce da qui), poi un peer per riga.
+function wg_dump() {
+	const lines = split(trim(sh('wg show wg0 dump 2>/dev/null')), '\n');
+	const res = { public_key: null, port: null, peers: {} };
+
+	for (let i = 0; i < length(lines); i++) {
+		const f = split(lines[i], '\t');
+
+		if (i == 0 && length(f) >= 3) {
+			res.public_key = f[1];
+			res.port = int(f[2]);
+		}
+		else if (length(f) >= 7) {
+			res.peers[f[0]] = { endpoint: f[2] == '(none)' ? null : f[2], handshake: int(f[4]), rx: int(f[5]), tx: int(f[6]) };
+		}
+	}
+
+	return res;
+}
+
+function wg_list() {
+	const c = cursor();
+	const d = wg_dump();
+	const now = time();
+	const peers = [];
+
+	c.load('network');
+	c.load('glgw');
+	c.foreach('network', 'wireguard_wg0', s => {
+		const live = d.peers[s.public_key] ?? {};
+
+		push(peers, {
+			name: s.description ?? '',
+			public_key: s.public_key,
+			address: join(', ', type(s.allowed_ips) == 'array' ? s.allowed_ips : [ s.allowed_ips ?? '' ]),
+			endpoint: live.endpoint,
+			handshake_ago: live.handshake > 0 ? now - live.handshake : null,
+			rx: live.rx ?? 0,
+			tx: live.tx ?? 0
+		});
+	});
+
+	return {
+		up: d.public_key != null,
+		public_key: d.public_key,
+		port: d.port ?? int(c.get('network', 'wg0', 'listen_port') ?? 0),
+		address: (c.get('network', 'wg0', 'addresses') ?? [])[0],
+		endpoint: c.get('glgw', 'vpn', 'endpoint') ?? '',
+		peers: peers,
+		files: map(filter(lsdir(VPN_DIR) ?? [], f => match(f, /^[A-Za-z0-9_-]{1,32}\.conf$/)), f => substr(f, 0, length(f) - 5))
+	};
+}
+
+function client_conf(name, priv, address, srv_pub, psk, endpoint, port) {
+	return sprintf('# %s — client WireGuard di gl.inet gw\n[Interface]\nPrivateKey = %s\nAddress = %s/32\nDNS = %s1\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s:%d\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n',
+		name, priv, address, WG_NET, srv_pub, psk, endpoint, port);
+}
+
+function wg_add(name) {
+	if (type(name) != 'string' || !match(name, /^[A-Za-z0-9 _-]{1,24}$/))
+		return { error: 'Nome non valido: lettere, numeri, spazi, - e _ (max 24)' };
+
+	const c = cursor();
+	const used = {};
+
+	c.load('network');
+	c.load('glgw');
+	c.foreach('network', 'wireguard_wg0', s => {
+		for (let a in (type(s.allowed_ips) == 'array' ? s.allowed_ips : [ s.allowed_ips ?? '' ])) {
+			const m = match(a, /^10\.66\.66\.([0-9]+)\//);
+			if (m) used[m[1]] = true;
+		}
+	});
+
+	let host = null;
+
+	for (let n = 2; n < 255; n++)
+		if (!used['' + n]) { host = n; break; }
+
+	if (host == null)
+		return { error: 'Nessun indirizzo libero in ' + WG_NET + '0/24' };
+
+	const keyfile = tmpdir() + '/wg.key';
+	const priv = trim(sh('umask 077; wg genkey'));
+
+	writefile(keyfile, priv + '\n');
+	const pub = trim(sh('wg pubkey < ' + keyfile));
+	unlink(keyfile);
+	const psk = trim(sh('wg genpsk'));
+
+	if (!match(priv, B64KEY) || !match(pub, B64KEY) || !match(psk, B64KEY))
+		return { error: 'Generazione delle chiavi non riuscita' };
+
+	const address = WG_NET + host;
+	const sid = c.add('network', 'wireguard_wg0');
+
+	c.set('network', sid, 'description', name);
+	c.set('network', sid, 'public_key', pub);
+	c.set('network', sid, 'preshared_key', psk);
+	c.set('network', sid, 'allowed_ips', [ address + '/32' ]);
+	c.save('network');
+	c.commit('network');
+	system('ifup wg0');  // netifd non riapplica i peer con un semplice reload
+
+	const d = wg_dump();
+	const port = d.port ?? int(c.get('network', 'wg0', 'listen_port') ?? 51820);
+
+	return {
+		name: name,
+		address: address,
+		endpoint_set: !!c.get('glgw', 'vpn', 'endpoint'),
+		config: client_conf(name, priv, address, d.public_key ?? '', psk, c.get('glgw', 'vpn', 'endpoint') ?? 'INDIRIZZO_PUBBLICO_DI_CASA', port)
+	};
+}
+
+function wg_del(pub) {
+	if (type(pub) != 'string' || !match(pub, B64KEY))
+		return { error: 'Chiave non valida' };
+
+	const c = cursor();
+	let sid = null;
+
+	c.load('network');
+	c.foreach('network', 'wireguard_wg0', s => { if (s.public_key == pub) sid = s['.name']; });
+
+	if (!sid)
+		return { error: 'Client non trovato' };
+
+	c.delete('network', sid);
+	c.save('network');
+	c.commit('network');
+	system('ifup wg0');  // netifd non riapplica i peer con un semplice reload
+
+	return wg_list();
+}
+
+// --- NetBird --------------------------------------------------------------------
+
+function nb_status() {
+	const j = json(sh('netbird status --json 2>/dev/null') || '{}') ?? {};
+	const log = readfile(TMP + '/nb-login.log') ?? '';
+	const url = match(log, /https:\/\/[^ \t\r\n"']+/);
+	const peers = map(j.peers?.details ?? [], p => ({
+		fqdn: p.fqdn, ip: p.netbirdIp, status: p.status, type: p.connectionType, latency: p.latency
+	}));
+
+	return {
+		daemon: j.daemonStatus ?? 'unknown',
+		version: j.daemonVersion,
+		management: { url: j.management?.url, connected: !!j.management?.connected, error: j.management?.error },
+		signal: { connected: !!j.signal?.connected },
+		ip: j.netbirdIp,
+		fqdn: j.fqdn,
+		peers: { total: j.peers?.total ?? 0, connected: j.peers?.connected ?? 0, list: peers },
+		networks: j.networks ?? [],
+		login_url: (j.daemonStatus != 'Connected' && url) ? url[0] : null,
+		service: service('netbird')
+	};
+}
+
+function nb_opts(mgmt, hostname) {
+	let o = ' --disable-dns';
+
+	if (length(mgmt)) o += ' --management-url ' + mgmt;
+	if (length(hostname)) o += ' --hostname ' + hostname;
+
+	return o;
+}
+
+function nb_up(mode, key, mgmt, hostname) {
+	mgmt = mgmt ?? '';
+	hostname = hostname ?? '';
+
+	if (length(mgmt) && !match(mgmt, /^https?:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?\/?$/))
+		return { error: 'Indirizzo del server di gestione non valido' };
+	if (length(hostname) && !match(hostname, /^[A-Za-z0-9-]{1,63}$/))
+		return { error: 'Nome del dispositivo non valido' };
+
+	if (mode == 'key') {
+		if (type(key) != 'string' || !match(key, /^[A-Za-z0-9-]{8,128}$/))
+			return { error: 'Chiave di registrazione non valida' };
+
+		const kf = tmpdir() + '/nb.key';
+
+		system('umask 077; : > ' + kf);
+		writefile(kf, key);
+		const rc = system('netbird up --setup-key-file ' + kf + nb_opts(mgmt, hostname) + ' >' + TMP + '/nb-up.log 2>&1', 60000);
+		unlink(kf);
+
+		const st = nb_status();
+
+		if (rc != 0)
+			st.error = 'Collegamento non riuscito: ' + trim(substr(readfile(TMP + '/nb-up.log') ?? '', -400));
+
+		return st;
+	}
+
+	if (mode == 'sso') {
+		tmpdir();
+		unlink(TMP + '/nb-login.log');
+		// Il login SSO aspetta che l'utente accetti nel browser: gira in background,
+		// il link compare in nb_status.
+		system('(netbird up --no-browser' + nb_opts(mgmt, hostname) + ' >' + TMP + '/nb-login.log 2>&1 &) </dev/null >/dev/null 2>&1');
+		sleep(3000);
+
+		return nb_status();
+	}
+
+	return { error: 'Modalità non valida' };
+}
+
+// --- DNS: AdGuard Home → Unbound -----------------------------------------------------
+
+function dns_status() {
+	const y = readfile('/etc/adguardhome/adguardhome.yaml') ?? '';
+	const port = match(y, /\n  address: [0-9.]*:([0-9]+)/);
+	const ups = match(y, /\n  upstream_dns:\n((    - [^\n]*\n)+)/);
+	const ub = {};
+
+	for (let l in split(sh('unbound-control stats_noreset 2>/dev/null'), '\n')) {
+		const kv = split(l, '=');
+		if (length(kv) == 2) ub[kv[0]] = +kv[1];
+	}
+
+	return {
+		adguard: service('adguardhome'),
+		adguard_port: port ? int(port[1]) : 3000,
+		upstreams: ups ? map(filter(split(trim(ups[1]), '\n'), l => length(l)), l => trim(replace(l, /^ *- */, ''), "'\" ")) : [],
+		unbound: service('unbound'),
+		unbound_stats: {
+			queries: ub['total.num.queries'] ?? 0,
+			cachehits: ub['total.num.cachehits'] ?? 0,
+			secure: ub['num.answer.secure'] ?? 0,
+			bogus: ub['num.answer.bogus'] ?? 0,
+			uptime: ub['time.up'] ?? 0
+		}
+	};
+}
+
+function service_set(name, on) {
+	if (name != 'adguardhome' && name != 'unbound' && name != 'netbird' && name != 'samba4')
+		return { error: 'Servizio non gestito' };
+
+	system('/etc/init.d/' + name + (on ? ' enable' : ' disable'));
+	system('/etc/init.d/' + name + (on ? ' restart' : ' stop'), 30000);
+
+	return service(name);
+}
+
+// NAS interno: file ext4 a dimensione fissa sulla memoria interna, montato su
+// /srv/nas e condiviso come "brume". Non riempie mai l'eMMC oltre la sua dimensione.
+const NAS_IMG = '/opt/nas.img', NAS_DIR = '/srv/nas';
+
+function nas_mounted() {
+	return index(readfile('/proc/mounts') ?? '', ' ' + NAS_DIR + ' ') >= 0;
+}
+
+function st_internal() {
+	const free = split(replace((split(trim(sh('df -k /overlay 2>/dev/null')), '\n')[1] ?? ''), /[ ]+/g, ' '), ' ');
+	const res = { exists: stat(NAS_IMG) != null, mounted: nas_mounted(), share: 'brume', free: int(free[3] ?? 0) * 1024 };
+
+	if (res.mounted) {
+		const df = split(replace((split(trim(sh('df -k ' + NAS_DIR + ' 2>/dev/null')), '\n')[1] ?? ''), /[ ]+/g, ' '), ' ');
+
+		res.total = int(df[1] ?? 0) * 1024;
+		res.used = int(df[2] ?? 0) * 1024;
+	}
+
+	return res;
+}
+
+// --- Disco USB e Samba ------------------------------------------------------------
+
+function st_status() {
+	const disks = [];
+
+	for (let l in split(sh('block info 2>/dev/null'), '\n')) {
+		const dev = match(l, /^\/dev\/(sd[a-z][0-9]*):/);
+
+		if (!dev)
+			continue;
+
+		const attr = k => (match(l, regexp(k + '="([^"]*)"')) ?? [])[1];
+		const mount = attr('MOUNT');
+		const d = { dev: dev[1], label: attr('LABEL'), type: attr('TYPE'), mount: mount };
+
+		if (mount) {
+			const df = split(trim(sh('df -k ' + mount + ' 2>/dev/null')), '\n');
+			const f = split(replace(df[length(df) - 1] ?? '', /[ ]+/g, ' '), ' ');
+
+			d.total = int(f[1]) * 1024;
+			d.used = int(f[2]) * 1024;
+		}
+
+		push(disks, d);
+	}
+
+	const c = cursor();
+
+	c.load('samba4');
+
+	return {
+		disks: disks,
+		internal: st_internal(),
+		samba: service('samba4'),
+		share: c.get('samba4', 'usb', 'name') ?? 'usb',
+		user: c.get('samba4', 'usb', 'users') ?? 'nas',
+		user_ready: index(sh('pdbedit -L 2>/dev/null'), 'nas:') >= 0
+	};
+}
+
+function st_internal_create(gb) {
+	if (type(gb) != 'int' || gb < 1 || gb > 6)
+		return { error: 'Dimensione non valida (da 1 a 6 GB)' };
+	if (stat(NAS_IMG))
+		return { error: 'Lo spazio interno esiste già' };
+
+	const free = st_internal().free;
+
+	// Almeno 1,5 GB restano al sistema (AdGuard, Unbound, backup, aggiornamenti dei pacchetti).
+	if (free - gb * 1073741824 < 1610612736)
+		return { error: 'Spazio libero insufficiente: lascia almeno 1,5 GB al sistema' };
+
+	// File sparso: lo spazio si occupa man mano che lo si riempie.
+	if (system('dd if=/dev/zero of=' + NAS_IMG + ' bs=1M count=0 seek=' + (gb * 1024) + ' 2>/dev/null') != 0 ||
+	    system('mkfs.ext4 -q -F -m 0 -L brume-nas ' + NAS_IMG + ' >/dev/null 2>&1', 120000) != 0) {
+		unlink(NAS_IMG);
+		return { error: 'Creazione dello spazio non riuscita' };
+	}
+
+	system('chmod 600 ' + NAS_IMG);
+	system('/etc/init.d/glgw-nas enable; /etc/init.d/glgw-nas start', 30000);
+
+	const c = cursor();
+
+	c.load('samba4');
+	c.set('samba4', 'brume', 'sambashare');
+	c.set('samba4', 'brume', 'name', 'brume');
+	c.set('samba4', 'brume', 'path', NAS_DIR);
+	c.set('samba4', 'brume', 'read_only', 'no');
+	c.set('samba4', 'brume', 'guest_ok', 'no');
+	c.set('samba4', 'brume', 'users', 'nas');
+	c.set('samba4', 'brume', 'force_root', '1');
+	c.set('samba4', 'brume', 'create_mask', '0666');
+	c.set('samba4', 'brume', 'dir_mask', '0777');
+	c.save('samba4');
+	c.commit('samba4');
+	system('/etc/init.d/samba4 reload >/dev/null 2>&1', 30000);
+
+	return st_status();
+}
+
+function st_password(pw) {
+	if (type(pw) != 'string' || !match(pw, /^[\x20-\x7e]{8,64}$/))
+		return { error: 'La password deve avere da 8 a 64 caratteri stampabili' };
+
+	const p = popen('smbpasswd -s -a nas >/dev/null 2>&1', 'w');
+
+	if (!p)
+		return { error: 'smbpasswd non disponibile' };
+
+	p.write(pw + '\n' + pw + '\n');
+
+	return p.close() == 0 ? st_status() : { error: 'Impostazione della password non riuscita' };
+}
+
+function st_umount(dev) {
+	if (type(dev) != 'string' || !match(dev, /^sd[a-z][0-9]{0,2}$/))
+		return { error: 'Disco non valido' };
+
+	system('sync; umount /mnt/' + dev, 20000);
+
+	return st_status();
+}
+
+// --- Offload hardware e SQM ----------------------------------------------------------
+
+function net_status() {
+	const c = cursor();
+	const res = { offload: false, sqm: false, down: 0, up: 0 };
+
+	c.load('firewall');
+	c.load('sqm');
+	c.foreach('firewall', 'defaults', s => { res.offload = s.flow_offloading_hw == '1'; });
+
+	const q = c.get_all('sqm', 'wan');
+
+	if (q) {
+		res.sqm = q.enabled == '1';
+		res.down = int(q.download ?? 0);
+		res.up = int(q.upload ?? 0);
+	}
+
+	return res;
+}
+
+// Offload e SQM si escludono: i flussi in offload non passano dalle code.
+function net_set(mode, down, up) {
+	if (mode != 'offload' && mode != 'sqm' && mode != 'none')
+		return { error: 'Modalità non valida' };
+	if (mode == 'sqm' && (type(down) != 'int' || type(up) != 'int' || down < 1000 || up < 1000 || down > 2500000 || up > 2500000))
+		return { error: 'Velocità SQM non valide (da 1 a 2500 Mbit/s)' };
+
+	const c = cursor();
+
+	c.load('firewall');
+	c.load('sqm');
+	c.foreach('firewall', 'defaults', s => {
+		c.set('firewall', s['.name'], 'flow_offloading', mode == 'offload' ? '1' : '0');
+		c.set('firewall', s['.name'], 'flow_offloading_hw', mode == 'offload' ? '1' : '0');
+	});
+	c.foreach('sqm', 'queue', s => { if (s['.name'] != 'wan') c.set('sqm', s['.name'], 'enabled', '0'); });
+
+	if (!c.get('sqm', 'wan'))
+		c.set('sqm', 'wan', 'queue');
+
+	c.set('sqm', 'wan', 'interface', 'eth0');
+	c.set('sqm', 'wan', 'qdisc', 'cake');
+	c.set('sqm', 'wan', 'script', 'piece_of_cake.qos');
+	c.set('sqm', 'wan', 'linklayer', 'none');
+	c.set('sqm', 'wan', 'enabled', mode == 'sqm' ? '1' : '0');
+
+	if (mode == 'sqm') {
+		c.set('sqm', 'wan', 'download', '' + down);
+		c.set('sqm', 'wan', 'upload', '' + up);
+	}
+
+	c.save('firewall');
+	c.commit('firewall');
+	c.save('sqm');
+	c.commit('sqm');
+	system('/etc/init.d/firewall reload >/dev/null 2>&1', 30000);
+	system('/etc/init.d/sqm restart >/dev/null 2>&1', 30000);
+
+	return net_status();
+}
+
+// --- Password e accessi -------------------------------------------------------------
+// La password di root si cambia con luci.setPassword (metodo ufficiale di LuCI).
+// AdGuard Home vuole un hash bcrypt e non ha un'API per cambiarlo: l'hash lo
+// calcola il browser (bcryptjs), qui arriva solo l'hash, mai la password.
+
+const AGH_YAML = '/etc/adguardhome/adguardhome.yaml';
+const BCRYPT = /^\$2[aby]\$(0[4-9]|1[0-4])\$[.\/A-Za-z0-9]{53}$/;
+
+function agh_users() {
+	const names = [];
+	let inside = false;
+
+	for (let l in split(readfile(AGH_YAML) ?? '', '\n')) {
+		if (match(l, /^users:/)) { inside = true; continue; }
+		if (inside && match(l, /^[A-Za-z_]+:/)) break;
+
+		const m = inside ? match(l, /^ *- name: *(.+)$/) : null;
+
+		if (m) push(names, trim(m[1], "'\" "));
+	}
+
+	return names;
+}
+
+function acc_status() {
+	const shadow = match(readfile('/etc/shadow') ?? '', /(^|\n)root:([^:]*):/);
+	const hash = shadow ? shadow[2] : '';
+	const users = agh_users();
+	let keys = 0;
+
+	for (let l in split(readfile('/etc/dropbear/authorized_keys') ?? '', '\n'))
+		if (match(l, /^(ssh|ecdsa|sk-)/)) keys++;
+
+	return {
+		root: { set: length(hash) > 0 && substr(hash, 0, 1) != '!' && hash != '*' },
+		adguard: { login: length(users) > 0, users: users, running: service('adguardhome').running },
+		nas: { ready: index(sh('pdbedit -L 2>/dev/null'), 'nas:') >= 0 },
+		ssh_keys: keys
+	};
+}
+
+// Sostituisce il blocco "users:" del YAML di AdGuard Home (utente + hash, oppure
+// nessun utente = login disattivato), lo fa validare ad AdGuard e solo allora lo applica.
+function agh_login(user, hash) {
+	const block = [];
+
+	if (!length(user) && !length(hash)) {
+		push(block, 'users: []');
+	}
+	else {
+		if (type(user) != 'string' || !match(user, /^[A-Za-z0-9_.-]{1,32}$/))
+			return { error: 'Nome utente non valido: lettere, numeri, . - _ (max 32)' };
+		if (type(hash) != 'string' || !match(hash, BCRYPT))
+			return { error: 'Hash della password non valido' };
+
+		push(block, 'users:', '  - name: ' + user, '    password: ' + hash);
+	}
+
+	const lines = split(readfile(AGH_YAML) ?? '', '\n');
+	let i = -1, j = -1;
+
+	for (let k = 0; k < length(lines); k++) {
+		if (i < 0 && match(lines[k], /^users:/)) i = k;
+		else if (i >= 0 && match(lines[k], /^[A-Za-z_]+:/)) { j = k; break; }
+	}
+
+	if (i < 0 || j < 0)
+		return { error: 'Configurazione di AdGuard Home non riconosciuta' };
+
+	const out = [];
+
+	for (let k = 0; k < i; k++) push(out, lines[k]);
+	for (let b in block) push(out, b);
+	for (let k = j; k < length(lines); k++) push(out, lines[k]);
+
+	const tmp = tmpdir() + '/agh.yaml';
+
+	system('umask 077; : > ' + tmp);
+	writefile(tmp, join('\n', out));
+
+	if (system('AdGuardHome --check-config -c ' + tmp + ' --work-dir /opt/adguardhome --no-check-update >/dev/null 2>&1', 30000) != 0) {
+		unlink(tmp);
+		return { error: 'AdGuard Home ha rifiutato la nuova configurazione: nulla è stato cambiato' };
+	}
+
+	system('cp -p ' + AGH_YAML + ' ' + AGH_YAML + '.bak-gui');
+	system('/etc/init.d/adguardhome stop', 20000);
+	system('cat ' + tmp + ' > ' + AGH_YAML);
+	unlink(tmp);
+	system('/etc/init.d/adguardhome start', 20000);
+
+	return acc_status();
+}
+
+// --- Aggiornamenti del firmware -------------------------------------------------------
+
+// Le immagini le costruisce GitHub Actions nel repository pubblico FW_REPO, una
+// release "openwrt-<versione>" per ogni OpenWrt stabile. Qui si leggono solo i
+// metadati dell'ultima release; download, SHA-256 e sysupgrade li fa
+// /usr/sbin/glgw-fwupgrade in background, scrivendo lo stato in fw-state.
+const FW_REPO = 'mich-de/brume-firmware';
+const FW_VER = /^[0-9]+\.[0-9]+\.[0-9]+$/;
+
+function fw_version() {
+	return match(readfile('/etc/openwrt_release') ?? '', /DISTRIB_RELEASE='([^']+)'/)?.[1] ?? '?';
+}
+
+// "25.12.6" più nuova di "25.12.5": confronto numerico campo per campo
+function fw_newer(a, b) {
+	const x = map(split(a, '.'), n => int(n)), y = map(split(b, '.'), n => int(n));
+
+	for (let i = 0; i < 3; i++)
+		if (x[i] != y[i])
+			return x[i] > y[i];
+
+	return false;
+}
+
+function fw_running() {
+	const pid = int(trim(readfile(TMP + '/fw-pid') ?? '0'));
+
+	return pid > 0 && stat('/proc/' + pid) != null;
+}
+
+function fw_status() {
+	const c = json(readfile(TMP + '/fw.json') ?? 'null');
+	const cur = fw_version();
+
+	return {
+		current: cur,
+		latest: c?.version,
+		checked: c?.checked ?? 0,
+		published: c?.published,
+		url: c?.url,
+		available: c != null && match(cur, FW_VER) != null && fw_newer(c.version, cur),
+		state: trim(readfile(TMP + '/fw-state') ?? ''),
+		running: fw_running(),
+		nas: stat(NAS_IMG) != null,
+		repo: FW_REPO
+	};
+}
+
+function fw_check() {
+	const j = json(sh('uclient-fetch -q -T 15 -O - https://api.github.com/repos/' + FW_REPO + '/releases/latest 2>/dev/null') || 'null');
+	const v = (type(j) == 'object') ? substr(j.tag_name ?? '', 8) : '';
+	const name = 'openwrt-' + v + '-mediatek-filogic-glinet_gl-mt2500-airoha-squashfs-sysupgrade.bin';
+
+	if (substr(j?.tag_name ?? '', 0, 8) != 'openwrt-' || !match(v, FW_VER) ||
+	    !length(filter(j.assets ?? [], a => a.name == name)) || !length(filter(j.assets ?? [], a => a.name == 'sha256sums.txt')))
+		return { error: 'GitHub non ha risposto o l\'ultima release non contiene l\'immagine per il Brume' };
+
+	tmpdir();
+	writefile(TMP + '/fw.json', sprintf('%J', { checked: time(), version: v, published: j.published_at, url: j.html_url }));
+
+	return fw_status();
+}
+
+function fw_upgrade() {
+	const s = fw_status();
+
+	if (s.running)
+		return { error: 'Aggiornamento già in corso' };
+	if (!s.available)
+		return { error: 'Nessun aggiornamento disponibile: premi prima "Controlla ora"' };
+
+	tmpdir();
+	writefile(TMP + '/fw-state', 'download\n');
+	system('(/usr/sbin/glgw-fwupgrade ' + s.latest + ' &) </dev/null >/dev/null 2>&1');
+
+	return fw_status();
+}
+
+// --- Avvisi e manutenzione ---------------------------------------------------------
+
+function last_backup() {
+	const dirs = [ '/opt/brume-backup' ];
+	let best = 0;
+
+	for (let m in lsdir('/mnt') ?? []) push(dirs, '/mnt/' + m + '/.brume-backup');
+
+	for (let d in dirs)
+		for (let f in lsdir(d) ?? [])
+			if (match(f, /^brume-.*\.tar\.gz$/)) {
+				const s = stat(d + '/' + f);
+				if (s && s.mtime > best) best = s.mtime;
+			}
+
+	return best;
+}
+
+// La porta LAN deve restare fuori dalla rete di casa: se sul lato LAN si vede il
+// MAC della WAN del Brume stesso o un vicino della sottorete WAN, c'è un anello.
+function lan_on_home() {
+	const neigh = sh('ip neigh show dev br-lan 2>/dev/null');
+	const wanmac = sysfs('/sys/class/net/eth0/address');
+	const wanip = match(sh('ip -4 -o addr show dev eth0 2>/dev/null'), /inet ([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+\//);
+
+	return (length(wanmac) && index(neigh, wanmac) >= 0) ||
+		(wanip && index(neigh, wanip[1] + '.') == 0) || (wanip && index(neigh, '\n' + wanip[1] + '.') >= 0);
+}
+
+function agh_stats() {
+	const j = json(sh('uclient-fetch -q -T 2 -O - http://127.0.0.1:3000/control/stats 2>/dev/null') || 'null');
+
+	return (type(j) == 'object' && j.num_dns_queries != null)
+		? { queries: j.num_dns_queries, blocked: (j.num_blocked_filtering ?? 0) + (j.num_replaced_safebrowsing ?? 0) + (j.num_replaced_parental ?? 0) }
+		: null;
+}
+
+function maintenance() {
+	const bj = json(readfile('/var/run/banIP/banIP.runtime.json') ?? 'null') ?? {};
+	const df = split(replace((split(trim(sh('df -k /overlay 2>/dev/null')), '\n')[1] ?? ''), /[ ]+/g, ' '), ' ');
+	let filters = 0;
+
+	for (let f in lsdir('/opt/adguardhome/data/filters') ?? []) {
+		const s = stat('/opt/adguardhome/data/filters/' + f);
+		if (s && s.size > 1024) filters++;
+	}
+
+	return {
+		// element_count: "32 891 (chains: 7, …)", migliaia separate da spazi
+		banip: { status: bj.status ?? 'off', elements: int(replace((match(bj.element_count ?? '', /^[0-9 ]+/) ?? [ '0' ])[0], / /g, '')) },
+		watchcat: system('pgrep -f watchcat.sh >/dev/null 2>&1') == 0,
+		backup: last_backup(),
+		filters: filters,
+		overlay: { total: int(df[1] ?? 0) * 1024, used: int(df[2] ?? 0) * 1024 },
+		adguard: agh_stats(),
+		lan_on_home: lan_on_home(),
+		clock_ok: time() > 1782000000,
+		firmware: fw_status()
+	};
+}
+
+// Cosa non va, dal più grave: err, warn, info. page = pagina Brume dove si sistema.
+function alerts(st, m, acc) {
+	const a = [];
+	const add = (level, title, text, page) => push(a, { level: level, title: title, text: text, page: page });
+	const svc = {};
+
+	for (let s in st.services) svc[s.name] = s;
+
+	if (!acc.root.set) add('err', 'Router senza password', 'Chiunque sulla rete di casa può entrare in questo pannello e in SSH.', 'access');
+	if (m.lan_on_home) add('err', 'Porta LAN collegata alla rete di casa', 'Il Brume vede la rete di casa anche dalla porta LAN: è un doppio collegamento. Lascia collegata solo la porta WAN.', 'clients');
+	if (!st.wan.carrier) add('err', 'Nessun cavo nella porta WAN', 'Senza WAN niente internet, niente DNS per la casa e niente VPN.', 'overview');
+	else if (!st.internet) add('err', 'Internet non raggiungibile', 'La WAN è collegata ma 1.1.1.1 e 9.9.9.9 non rispondono (controllo ogni minuto).', 'overview');
+	if (!m.clock_ok) add('err', 'Ora del router sbagliata', 'Senza l\'ora giusta DNSSEC e i certificati non funzionano: controlla la WAN e l\'NTP.', 'overview');
+	if (!svc.adguardhome?.running) add('err', 'AdGuard Home fermo', 'La casa resta senza DNS e senza blocco pubblicità.', 'dns');
+	else if (!m.filters) add('warn', 'Liste di blocco non scaricate', 'AdGuard Home è attivo ma non blocca nulla: le liste si scaricano quando c\'è internet.', 'dns');
+	if (!svc.unbound?.running) add('warn', 'Unbound fermo', 'AdGuard Home usa i DNS di riserva esterni, in chiaro.', 'dns');
+	if (!acc.adguard.login) add('warn', 'AdGuard Home senza login', 'Chiunque in casa può spegnere il blocco o cambiare le liste.', 'access');
+	if (m.banip.status != 'active') add('warn', 'banIP non attivo', 'Gli indirizzi malevoli noti non vengono bloccati.', 'overview');
+	if (st.temp >= 75) add('warn', 'Temperatura alta', 'Il router è a ' + st.temp + ' °C.', 'overview');
+	if (st.mem_avail < 100 * 1024 * 1024) add('warn', 'Poca memoria libera', 'Meno di 100 MB di RAM disponibili.', 'overview');
+	if (st.emmc_wear != null && st.emmc_wear >= 7) add('warn', 'Memoria interna usurata', 'L\'eMMC segnala un\'usura oltre il 60%.', 'overview');
+	if (m.overlay.total && m.overlay.used * 10 >= m.overlay.total * 9) add('warn', 'Memoria interna quasi piena', 'Oltre il 90% dello spazio interno è occupato.', 'storage');
+	if (m.firmware.available) add('info', 'Nuovo firmware: OpenWrt ' + m.firmware.latest, 'Si installa da Aggiornamenti; configurazione, AdGuard Home, VPN e NetBird restano.', 'update');
+	if (!m.backup) add('info', 'Nessun backup della configurazione', 'Il backup notturno non è ancora stato fatto.', 'storage');
+	else if (time() - m.backup > 3 * 86400) add('warn', 'Backup vecchio', 'L\'ultimo backup della configurazione ha più di 3 giorni.', 'storage');
+	if (!m.watchcat) add('info', 'Controllo connessione spento', 'Watchcat non riavvia la WAN se internet si blocca.', 'overview');
+	if (st.netbird.daemon == 'NeedsLogin') add('info', 'NetBird da collegare', 'Il Brume non è ancora nella tua rete NetBird.', 'netbird');
+	if (svc.samba4?.running && !acc.nas.ready) add('info', 'Cartella condivisa senza password', 'Imposta la password dell\'utente nas per usarla.', 'access');
+
+	const c = cursor();
+
+	c.load('glgw');
+	if (!c.get('glgw', 'vpn', 'endpoint')) add('info', 'VPN: indirizzo pubblico mancante', 'I nuovi client WireGuard non sapranno dove trovare casa.', 'wireguard');
+
+	const never = map(filter(wg_list().peers, p => p.handshake_ago == null), p => p.name || p.address);
+
+	if (length(never)) add('info', 'Client VPN mai collegati', join(', ', never) + ': se non li usi, eliminali.', 'wireguard');
+
+	const rank = { err: 0, warn: 1, info: 2 };
+
+	return sort(a, (x, y) => rank[x.level] - rank[y.level]);
+}
+
+// --- Riepilogo ------------------------------------------------------------------
+
+function status() {
+	const mem = {};
+
+	for (let l in split(readfile('/proc/meminfo') ?? '', '\n')) {
+		const m = match(l, /^(MemTotal|MemAvailable):[ ]+([0-9]+) kB/);
+		if (m) mem[m[1]] = int(m[2]) * 1024;
+	}
+
+	const d = wg_dump();
+	const now = time();
+	let wg_active = 0;
+
+	for (let k in d.peers)
+		if (d.peers[k].handshake > 0 && now - d.peers[k].handshake < 180) wg_active++;
+
+	const nb = json(sh('netbird status --json 2>/dev/null') || '{}') ?? {};
+	const life = split(sysfs('/sys/class/block/mmcblk0/device/life_time'), ' ');
+
+	const res = {
+		internet: sysfs('/sys/class/leds/blue:system/brightness') != '0',
+		wan: { carrier: sysfs('/sys/class/net/eth0/carrier') == '1', speed: int(sysfs('/sys/class/net/eth0/speed') || '0') },
+		lan: { carrier: sysfs('/sys/class/net/eth1/carrier') == '1', speed: int(sysfs('/sys/class/net/eth1/speed') || '0') },
+		temp: int(sysfs('/sys/class/thermal/thermal_zone0/temp') || '0') / 1000,
+		mem_total: mem.MemTotal ?? 0,
+		mem_avail: mem.MemAvailable ?? 0,
+		emmc_wear: life[0] ? hex(life[0]) : null,
+		uptime: int(split(readfile('/proc/uptime') ?? '0', ' ')[0]),
+		services: map(keys(SERVICES), n => { const s = service(n); s.name = n; return s; }),
+		wg: { up: d.public_key != null, peers: length(keys(d.peers)), active: wg_active },
+		netbird: { daemon: nb.daemonStatus ?? 'unknown', ip: nb.netbirdIp, peers: nb.peers?.connected ?? 0 },
+		net: net_status()
+	};
+
+	res.maint = maintenance();
+	res.alerts = alerts(res, res.maint, acc_status());
+
+	return res;
+}
+
+const methods = {
+	status: { call: () => status() },
+
+	wg_list: { call: () => wg_list() },
+	wg_add: { args: { name: 'name' }, call: req => wg_add(req.args?.name) },
+	wg_del: { args: { public_key: 'public_key' }, call: req => wg_del(req.args?.public_key) },
+	wg_endpoint: {
+		args: { endpoint: 'endpoint' },
+		call: function(req) {
+			const e = req.args?.endpoint ?? '';
+
+			if (length(e) && !match(e, /^[A-Za-z0-9.:-]{1,253}$/))
+				return { error: 'Indirizzo non valido' };
+
+			const c = cursor();
+
+			c.load('glgw');
+			if (!c.get('glgw', 'vpn'))
+				c.set('glgw', 'vpn', 'vpn');
+			c.set('glgw', 'vpn', 'endpoint', e);
+			c.save('glgw');
+			c.commit('glgw');
+
+			return wg_list();
+		}
+	},
+	// File di configurazione client salvati sul router (es. "telefono" del primo avvio).
+	wg_file: {
+		args: { name: 'name', action: 'action' },
+		call: function(req) {
+			const n = req.args?.name, a = req.args?.action;
+
+			if (type(n) != 'string' || !match(n, /^[A-Za-z0-9_-]{1,32}$/) || (a != 'get' && a != 'delete'))
+				return { error: 'Parametri non validi' };
+
+			const p = VPN_DIR + '/' + n + '.conf';
+
+			if (a == 'get')
+				return { name: n, config: readfile(p) ?? '' };
+
+			unlink(p);
+
+			return wg_list();
+		}
+	},
+
+	nb_status: { call: () => nb_status() },
+	nb_up: {
+		args: { mode: 'mode', key: 'key', management_url: 'management_url', hostname: 'hostname' },
+		call: req => nb_up(req.args?.mode, req.args?.key, req.args?.management_url, req.args?.hostname)
+	},
+	nb_down: {
+		call: function() {
+			system('netbird down >/dev/null 2>&1', 30000);
+			unlink(TMP + '/nb-login.log');
+
+			return nb_status();
+		}
+	},
+
+	dns_status: { call: () => dns_status() },
+	service_set: {
+		args: { name: 'name', enabled: true },
+		call: req => service_set(req.args?.name, !!req.args?.enabled)
+	},
+
+	st_status: { call: () => st_status() },
+	st_password: { args: { password: 'password' }, call: req => st_password(req.args?.password) },
+	st_umount: { args: { dev: 'dev' }, call: req => st_umount(req.args?.dev) },
+	st_internal_create: { args: { gb: 0 }, call: req => st_internal_create(req.args?.gb) },
+
+	acc_status: { call: () => acc_status() },
+	agh_login: { args: { username: 'username', hash: 'hash' }, call: req => agh_login(req.args?.username ?? '', req.args?.hash ?? '') },
+	root_clear: {
+		call: function() {
+			system('passwd -d root >/dev/null 2>&1');
+
+			return acc_status();
+		}
+	},
+
+	fw_status: { call: () => fw_status() },
+	fw_check: { call: () => fw_check() },
+	fw_upgrade: { call: () => fw_upgrade() },
+	net_status: { call: () => net_status() },
+	net_set: {
+		args: { mode: 'mode', down: 0, up: 0 },
+		call: req => net_set(req.args?.mode, req.args?.down, req.args?.up)
+	}
+};
+
+return { 'luci.glgw': methods };

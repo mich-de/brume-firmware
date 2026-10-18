@@ -1,0 +1,53 @@
+{
+	"admin/glgw": {
+		"title": "Brume",
+		"order": 1,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-glgw" ] }
+	},
+	"admin/glgw/overview": {
+		"title": "Panoramica",
+		"order": 10,
+		"action": { "type": "view", "path": "glgw/overview" }
+	},
+	"admin/glgw/clients": {
+		"title": "Dispositivi",
+		"order": 15,
+		"action": { "type": "view", "path": "glgw/clients" }
+	},
+	"admin/glgw/wireguard": {
+		"title": "Server WireGuard",
+		"order": 20,
+		"action": { "type": "view", "path": "glgw/wireguard" }
+	},
+	"admin/glgw/netbird": {
+		"title": "NetBird",
+		"order": 25,
+		"action": { "type": "view", "path": "glgw/netbird" }
+	},
+	"admin/glgw/dns": {
+		"title": "DNS e blocco pubblicità",
+		"order": 30,
+		"action": { "type": "view", "path": "glgw/dns" }
+	},
+	"admin/glgw/storage": {
+		"title": "Archiviazione di rete",
+		"order": 40,
+		"action": { "type": "view", "path": "glgw/storage" }
+	},
+	"admin/glgw/access": {
+		"title": "Password e accessi",
+		"order": 45,
+		"action": { "type": "view", "path": "glgw/access" }
+	},
+	"admin/glgw/update": {
+		"title": "Aggiornamenti",
+		"order": 50,
+		"action": { "type": "view", "path": "glgw/update" }
+	},
+	"admin/glgw/network": {
+		"title": "Accelerazione e SQM",
+		"order": 50,
+		"action": { "type": "view", "path": "glgw/network" }
+	}
+}

@@ -1,0 +1,87 @@
+# Firmware del Brume (GL-MT2500) per ogni nuova OpenWrt stabile.
+# Ogni giorno legge l'ultima stabile da downloads.openwrt.org; se non c'è ancora
+# una release "openwrt-<versione>" in questo repository, costruisce l'immagine con
+# build/build.sh (ImageBuilder ufficiale + build/files) e la pubblica come release.
+# A mano (Actions › Firmware Brume › Run workflow) si può ricostruire una versione
+# qualsiasi, per esempio dopo una modifica alla GUI: la release viene aggiornata.
+name: Firmware Brume
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versione OpenWrt (vuoto = ultima stabile)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency: firmware
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT: ${{ inputs.version }}
+        run: |
+          v="${INPUT:-$(curl -fsSL https://downloads.openwrt.org/.versions.json | jq -r .stable_version)}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || { echo "::error::versione non valida: $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ -z "$INPUT" ] && gh release view "openwrt-$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "OpenWrt $v già pubblicata, niente da fare"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Dipendenze dell'ImageBuilder
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq build-essential file gawk gettext libncurses-dev python3 python3-setuptools rsync unzip wget xsltproc zstd
+
+      - name: Costruisci l'immagine
+        run: OPENWRT_VERSION="$V" build/build.sh
+
+      - name: Pubblica la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd build/out
+          bin=$(ls *-squashfs-sysupgrade.bin)
+          sha256sum "$bin" > sha256sums.txt
+          cat > notes.md <<EOF
+          Firmware del Brume (GL-MT2500, profilo \`glinet_gl-mt2500-airoha\`) su **OpenWrt $V**, con GUI Brume, tema routerino e tutte le funzioni di \`build/build.sh\`.
+
+          **Prima di aggiornare:** copia altrove i file dello spazio interno (cartella \`brume\`): l'aggiornamento lo cancella. Dischi USB, configurazione, AdGuard Home e NetBird restano.
+
+          **Come aggiornare** (impostazioni mantenute):
+          - dalla GUI: Sistema › Backup / Aggiorna firmware › *Aggiorna firmware*, scegli \`$bin\`, lascia **Mantieni impostazioni** attivo e controlla che lo SHA-256 mostrato sia uguale a quello sotto;
+          - da SSH: \`scp $bin root@192.168.188.56:/tmp/ && ssh root@192.168.188.56 sysupgrade -v /tmp/$bin\`.
+
+          SHA-256: \`$(cut -d' ' -f1 sha256sums.txt)\`
+          EOF
+          if gh release view "openwrt-$V" >/dev/null 2>&1; then
+            gh release upload "openwrt-$V" "$bin" *.manifest sha256sums.txt --clobber
+            gh release edit "openwrt-$V" --notes-file notes.md
+          else
+            gh release create "openwrt-$V" "$bin" *.manifest sha256sums.txt \
+              --target "$GITHUB_SHA" --title "Brume — OpenWrt $V" --notes-file notes.md
+          fi

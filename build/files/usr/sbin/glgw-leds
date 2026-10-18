@@ -1,0 +1,23 @@
+#!/bin/sh
+# LED di gl.inet gw, aggiornati ogni minuto da cron:
+#   blue:system  acceso = internet raggiungibile
+#   white:system acceso = AdGuard Home in funzione
+#   white:vpn    acceso = almeno un client WireGuard collegato (handshake < 3 min)
+
+led() {
+	d=/sys/class/leds/$1
+	[ -d "$d" ] || return
+	[ "$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$d/trigger")" = none ] || echo none > "$d/trigger"
+	echo "$2" > "$d/brightness"
+}
+
+ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 9.9.9.9 >/dev/null 2>&1
+[ $? = 0 ] && led blue:system 1 || led blue:system 0
+
+pidof AdGuardHome >/dev/null && led white:system 1 || led white:system 0
+
+now=$(date +%s); vpn=0
+for t in $(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}'); do
+	[ "$t" -gt 0 ] && [ $((now - t)) -lt 180 ] && vpn=1
+done
+led white:vpn $vpn
