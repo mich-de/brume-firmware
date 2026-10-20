@@ -1,0 +1,103 @@
+# Firmware del Brume (GL-MT2500) per ogni nuova OpenWrt stabile.
+# Ogni giorno legge l'ultima stabile da downloads.openwrt.org; se non c'è ancora
+# una release "openwrt-<versione>" in questo repository, costruisce l'immagine con
+# build/build.sh (ImageBuilder ufficiale + build/files) e la pubblica come release.
+# A mano (Actions › Firmware Brume › Run workflow) si può ricostruire una versione
+# qualsiasi, per esempio dopo una modifica alla GUI: la release viene aggiornata.
+name: Firmware Brume
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versione OpenWrt (vuoto = ultima stabile)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency: firmware
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT: ${{ inputs.version }}
+        run: |
+          v="${INPUT:-$(curl -fsSL https://downloads.openwrt.org/.versions.json | jq -r .stable_version)}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || { echo "::error::versione non valida: $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ -z "$INPUT" ] && gh release view "openwrt-$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "OpenWrt $v già pubblicata, niente da fare"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      V: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Dipendenze dell'ImageBuilder
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq build-essential file gawk gettext libncurses-dev python3 python3-setuptools rsync unzip wget xsltproc zstd
+
+      - name: Costruisci l'immagine
+        run: OPENWRT_VERSION="$V" build/build.sh
+
+      - name: Pubblica la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd build/out
+          bin=$(ls *-squashfs-sysupgrade.bin)
+          man=$(ls *.manifest)
+          sha256sum "$bin" > sha256sums.txt
+          # novità rispetto alla release precedente: pacchetti (manifest) e commit del Brume
+          prev=$(gh release list --json tagName -q '.[].tagName' | grep -vx "openwrt-$V" | head -n 1 || true)
+          {
+            echo "### Novità"
+            echo
+            if [ -n "$prev" ] && gh release download "$prev" -p '*.manifest' -O ../prev.manifest; then
+              python3 ../release-notes.py ../prev.manifest "$man"
+            else
+              echo "- Prima release del Brume su OpenWrt $V"
+            fi
+            if [ -n "$prev" ] && git -C ../.. rev-parse -q --verify "refs/tags/$prev" >/dev/null; then
+              git -C ../.. log --format='- %s' "$prev..$GITHUB_SHA" -- build .github | grep . && echo || true
+            fi
+            echo
+            echo "Tutte le modifiche di OpenWrt $V: https://openwrt.org/releases/${V%.*}/changelog-$V"
+            echo
+            echo "### Come aggiornare"
+            echo
+            echo "- Dal Brume: Brume › Aggiornamenti › *Aggiorna a OpenWrt $V*. Scarica, controlla lo SHA-256 e installa mantenendo le impostazioni."
+            echo "- A mano: Sistema › Backup / Aggiorna firmware con \`$bin\` e *Mantieni impostazioni* attivo."
+            echo "- Lo spazio interno (cartella \`brume\`) viene cancellato: copia prima i file. Configurazione, AdGuard Home, VPN, NetBird e dischi USB restano."
+            echo
+            echo "SHA-256: \`$(cut -d' ' -f1 sha256sums.txt)\`"
+          } > notes.md
+          if gh release view "openwrt-$V" >/dev/null 2>&1; then
+            gh release upload "openwrt-$V" "$bin" "$man" sha256sums.txt --clobber
+            gh release edit "openwrt-$V" --notes-file notes.md
+          else
+            gh release create "openwrt-$V" "$bin" "$man" sha256sums.txt \
+              --target "$GITHUB_SHA" --title "Brume — OpenWrt $V" --notes-file notes.md
+          fi

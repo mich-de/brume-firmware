@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# NAS interno del Brume: file /opt/nas.img (ext4, dimensione fissa) montato su
+# /srv/nas prima di Samba. Si crea da Brume › Archiviazione di rete.
+# Nota: sta sulla memoria interna e un aggiornamento del firmware lo cancella.
+
+START=41
+STOP=95
+
+IMG=/opt/nas.img
+DIR=/srv/nas
+
+start() {
+	[ -f "$IMG" ] || return 0
+	mkdir -p "$DIR"
+	grep -q " $DIR " /proc/mounts || mount -t ext4 -o loop,noatime "$IMG" "$DIR"
+}
+
+stop() {
+	grep -q " $DIR " /proc/mounts && { sync; umount "$DIR"; }
+	return 0
+}

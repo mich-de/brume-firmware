@@ -1,0 +1,20 @@
+#!/bin/sh
+# routerino: registra il tema "Routerino" e, una sola volta per dispositivo, lo
+# rende predefinito con l'interfaccia in italiano. Dopo, tema e lingua restano
+# quelli scelti dall'utente (Sistema › Nome, ora e lingua) anche ai sysupgrade.
+
+uci -q get luci.themes >/dev/null || uci set luci.themes=internal
+uci -q get luci.themes.Routerino >/dev/null || uci set luci.themes.Routerino='/luci-static/routerino'
+
+touch "$IPKG_INSTROOT/etc/config/routerino"
+uci -q get routerino.defaults >/dev/null || uci set routerino.defaults=defaults
+
+if [ "$(uci -q get routerino.defaults.ui)" != 1 ]; then
+	uci set luci.main.mediaurlbase='/luci-static/routerino'
+	uci set luci.main.lang='it'
+	uci set routerino.defaults.ui='1'
+fi
+
+uci commit luci
+uci commit routerino
+exit 0

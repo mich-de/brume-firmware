@@ -1,0 +1,104 @@
+{#
+ Tema "routerino": barra laterale con le funzioni raggruppate per argomento
+ (menu-routerino.js), barra in alto con il percorso e gli indicatori di LuCI.
+ Lo stile dei moduli di LuCI (cbi) viene dal tema bootstrap, sopra il quale
+ routerino.css cambia l'impaginazione e i dettagli.
+-#}
+
+{%
+	import { getuid, getspnam } from 'luci.core';
+
+	const boardinfo = ubus.call('system', 'board');
+
+	http.prepare_content('text/html; charset=UTF-8');
+-%}
+
+<!DOCTYPE html>
+<html lang="{{ dispatcher.lang }}" class="quadro-partenze rt-qp" data-theme="dark">
+	<head>
+		<meta charset="utf-8">
+		<title>{{ striptags(`${boardinfo.hostname ?? '?'}${dispatched?.title ? ` | ${_(dispatched.title)}` : ''}`) }}</title>
+		<script>
+			(function() {
+				var root = document.documentElement, pref = null, media = window.matchMedia('(prefers-color-scheme: dark)');
+				try { pref = localStorage.getItem('rt-theme'); } catch (e) {}
+				pref = pref || 'dark'; // Brume: scuro di default
+				function apply() {
+					var dark = pref == 'dark' || (pref != 'light' && media.matches);
+					root.setAttribute('data-darkmode', dark);
+					root.setAttribute('data-theme', dark ? 'dark' : 'light');
+				}
+				media.addEventListener('change', apply);
+				apply();
+			})();
+		</script>
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="darkreader-lock">
+		<link rel="stylesheet" href="{{ media }}/routerino.css?v=18">
+		<link rel="icon" href="{{ media }}/logo.svg" sizes="any">
+		{% if (node?.css): %}
+		<link rel="stylesheet" href="{{ resource }}/{{ node.css }}">
+		{% endif %}
+		{% if (css): %}
+		<style title="text/css">{{ css }}</style>
+		{% endif %}
+		<script src="{{ dispatcher.build_url('admin/translations', dispatcher.lang) }}"></script>
+		<script src="{{ resource }}/cbi.js?v=26.288.56989~75a306d"></script>
+	</head>
+
+	<body class="rt-body lang_{{ dispatcher.lang }} {{ entityencode(striptags(node?.title ?? ''), true) }}{{ blank_page ? ' rt-blank' : '' }}" data-page="{{ entityencode(join('-', ctx.request_path), true) }}">
+		{% if (!blank_page): %}
+		<div class="rt-shell">
+			<aside class="rt-side quadro-partenze" data-theme="dark" id="rt-side" aria-label="Menu principale">
+				<a class="rt-brand" href="/">
+					<span class="rt-mark" aria-hidden="true">RTR</span>
+					<span class="rt-name"><strong>{{ striptags(boardinfo.hostname ?? '?') }}</strong><small><span class="quadro-partenze__live-dot"></span>{{ striptags(boardinfo.model ?? '') }}</small></span>
+				</a>
+				<button class="rt-search-btn" id="rt-search-btn" type="button">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+					<span>Cerca una funzione…</span><kbd>Ctrl K</kbd>
+				</button>
+				<nav class="rt-nav" id="rt-nav"></nav>
+				<div class="rt-side-foot" id="rt-side-foot"></div>
+			</aside>
+			<div class="rt-scrim" id="rt-scrim"></div>
+
+			<div class="rt-main">
+				<div class="rt-top">
+					<button class="rt-burger" id="rt-burger" type="button" aria-label="Apri il menu" aria-controls="rt-side" aria-expanded="false">
+						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+					</button>
+					<div class="rt-crumb" id="rt-crumb"></div>
+					<div id="indicators"></div>
+				</div>
+
+				<div id="maincontent" class="container">
+					{% if (getuid() == 0 && getspnam('root')?.pwdp === ''): %}
+					<div class="rt-alert">
+						<b>Nessuna password di amministratore.</b>
+						<span>Chiunque sia collegato al router può aprire queste pagine.</span>
+						{% if (dispatcher.lookup("admin/system/admin")): %}
+						<a class="btn cbi-button" href="{{ dispatcher.build_url("admin/system/admin") }}">Imposta una password</a>
+						{% endif %}
+					</div>
+					{% endif %}
+
+					{% if (boardinfo.rootfs_type == "initramfs"): %}
+					<div class="alert-message warning">
+						<h4>{{ _('System running in recovery (initramfs) mode.') }}</h4>
+						<p>{{ _('No changes to settings will be stored and are lost after rebooting. This mode should only be used to install a firmware upgrade') }}</p>
+						{% if (dispatcher.lookup("admin/system/flash")): %}
+						<div class="right"><a class="btn" href="{{ dispatcher.build_url("admin/system/flash") }}">{{ _('Go to firmware upgrade...') }}</a></div>
+						{% endif %}
+					</div>
+					{% endif %}
+
+					<noscript>
+						<div class="alert-message warning">
+							<h4>{{ _('JavaScript required!') }}</h4>
+							<p>{{ _('You must enable JavaScript in your browser or LuCI will not work properly.') }}</p>
+						</div>
+					</noscript>
+
+					<div id="tabmenu" style="display:none"></div>
+		{% endif %}
